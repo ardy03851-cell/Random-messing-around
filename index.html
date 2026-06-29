@@ -4500,9 +4500,173 @@ async function readZipFile(file) {
   }
 
   return entries
-    .filter(e => !e.name.endsWith('/'))
-    .map(e => ({ name: e.name, extract: () => extract(e) }));
+    .filter(e => !e.name.endsWith('/'))
+    .map(e => ({ name: e.name, extract: () => extract(e) }));
 }
+
+
+
+
+// ── Self-contained ZIP writer (no external library, no CDN) ──
+// Builds a standard ZIP file from an array of {name, data(Uint8Array)} entries
+// using only built-in browser APIs (CompressionStream for deflate).
+function zipCrc32(bytes) {
+  let table = zipCrc32.table;
+  if (!table) {
+    table = zipCrc32.table = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) {
+      let c = n;
+      for (let k = 0; k < 8; k++) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+      table[n] = c;
+    }
+  }
+  let crc = 0xffffffff;
+  for (let i = 0; i < bytes.length; i++) crc = table[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+
+
+
+async function zipDeflateRaw(bytes) {
+  const cs = new CompressionStream('deflate-raw');
+  const writer = cs.writable.getWriter();
+  writer.write(bytes);
+  writer.close();
+  const chunks = [];
+  const reader = cs.readable.getReader();
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+  }
+  const total = chunks.reduce((s, c) => s + c.length, 0);
+  const out = new Uint8Array(total);
+  let pos = 0;
+  for (const c of chunks) { out.set(c, pos); pos += c.length; }
+  return out;
+}
+
+
+
+
+function zipDosDateTime(date) {
+  const year = Math.max(1980, date.getFullYear()) - 1980;
+  const dosTime = (date.getHours() << 11) | (date.getMinutes() << 5) | (date.getSeconds() >> 1);
+  const dosDate = (year << 9) | ((date.getMonth() + 1) << 5) | date.getDate();
+  return { dosTime, dosDate };
+}
+
+
+
+
+async function createZip(entries) {
+  const encoder = new TextEncoder();
+  const { dosTime, dosDate } = zipDosDateTime(new Date());
+  const fileParts = [];
+  const centralParts = [];
+  let offset = 0;
+
+
+
+
+  for (const entry of entries) {
+    const nameBytes = encoder.encode(entry.name);
+    const rawData = entry.data;
+    const crc = zipCrc32(rawData);
+    let compMethod = 8;
+    let compData = await zipDeflateRaw(rawData);
+    if (compData.length >= rawData.length) { compMethod = 0; compData = rawData; }
+
+
+
+
+    const localHeaderOffset = offset;
+
+
+
+
+    const localHeader = new Uint8Array(30 + nameBytes.length);
+    const lv = new DataView(localHeader.buffer);
+    lv.setUint32(0, 0x04034b50, true);
+    lv.setUint16(4, 20, true);
+    lv.setUint16(6, 0, true);
+    lv.setUint16(8, compMethod, true);
+    lv.setUint16(10, dosTime, true);
+    lv.setUint16(12, dosDate, true);
+    lv.setUint32(14, crc, true);
+    lv.setUint32(18, compData.length, true);
+    lv.setUint32(22, rawData.length, true);
+    lv.setUint16(26, nameBytes.length, true);
+    lv.setUint16(28, 0, true);
+    localHeader.set(nameBytes, 30);
+
+
+
+
+    fileParts.push(localHeader, compData);
+    offset += localHeader.length + compData.length;
+
+
+
+
+    const centralHeader = new Uint8Array(46 + nameBytes.length);
+    const cv = new DataView(centralHeader.buffer);
+    cv.setUint32(0, 0x02014b50, true);
+    cv.setUint16(4, 20, true);
+    cv.setUint16(6, 20, true);
+    cv.setUint16(8, 0, true);
+    cv.setUint16(10, compMethod, true);
+    cv.setUint16(12, dosTime, true);
+    cv.setUint16(14, dosDate, true);
+    cv.setUint32(16, crc, true);
+    cv.setUint32(20, compData.length, true);
+    cv.setUint32(24, rawData.length, true);
+    cv.setUint16(28, nameBytes.length, true);
+    cv.setUint16(30, 0, true);
+    cv.setUint16(32, 0, true);
+    cv.setUint16(34, 0, true);
+    cv.setUint16(36, 0, true);
+    cv.setUint32(38, 0, true);
+    cv.setUint32(42, localHeaderOffset, true);
+    centralHeader.set(nameBytes, 46);
+    centralParts.push(centralHeader);
+  }
+
+
+
+
+  const centralDirOffset = offset;
+  let centralDirSize = 0;
+  for (const c of centralParts) centralDirSize += c.length;
+
+
+
+
+  const eocd = new Uint8Array(22);
+  const ev = new DataView(eocd.buffer);
+  ev.setUint32(0, 0x06054b50, true);
+  ev.setUint16(4, 0, true);
+  ev.setUint16(6, 0, true);
+  ev.setUint16(8, entries.length, true);
+  ev.setUint16(10, entries.length, true);
+  ev.setUint32(12, centralDirSize, true);
+  ev.setUint32(16, centralDirOffset, true);
+  ev.setUint16(20, 0, true);
+
+
+
+
+  const allParts = [...fileParts, ...centralParts, eocd];
+  const totalSize = allParts.reduce((s, p) => s + p.length, 0);
+  const result = new Uint8Array(totalSize);
+  let pos = 0;
+  for (const p of allParts) { result.set(p, pos); pos += p.length; }
+  return result;
+}
+
+
+
 
 async function handleUpload(input) {
   const allFiles = Array.from(input.files);
@@ -6839,9 +7003,30 @@ function exportProject() {
 }
 
 async function exportZip() {
-  // Simple multi-file export as combined HTML
-  exportProject();
-  showToast('ZIP export: use "Export HTML" for now', 'warn');
+  showToast('Building ZIP…', 'info');
+  try {
+    const entries = [];
+    for (const [name, file] of Object.entries(state.files)) {
+      if (file.isImage || file.isBinary) {
+        if (!file.objectUrl) continue;
+        const resp = await fetch(file.objectUrl);
+        const buf = await resp.arrayBuffer();
+        entries.push({ name, data: new Uint8Array(buf) });
+      } else {
+        entries.push({ name, data: new TextEncoder().encode(file.content || '') });
+      }
+    }
+
+    const zipBytes = await createZip(entries);
+    const blob = new Blob([zipBytes], { type: 'application/zip' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'webforge-export.zip';
+    a.click();
+    showToast('ZIP exported!', 'success');
+  } catch (err) {
+    showToast('ZIP export failed: ' + err.message, 'error');
+  }
 }
 
 // ════════════════════════════════════════
